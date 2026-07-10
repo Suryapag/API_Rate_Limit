@@ -1,0 +1,5 @@
+workspace:
+  id: bb0afff9-633a-4545-81cb-c5b34d05272b
+cloudResources:
+  collections:
+    ../postman/collections/API_RATE_LIMITER: 47999777-7a563d4a-5df3-4d49-9838-9192ab120502

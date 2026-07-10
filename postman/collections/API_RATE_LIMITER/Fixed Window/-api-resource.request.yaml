@@ -1,0 +1,7 @@
+$kind: http-request
+name: /api/resource
+url: http://localhost:8080/api/resource
+method: GET
+headers:
+  X-Client-Id: "9092"
+order: 1000

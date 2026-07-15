@@ -1,10 +1,10 @@
-package com.ratelimiter.fixedwindow;
+package com.ratelimiter.tokenbucket;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 @SpringBootTest
-class FixedwindowApplicationTests {
+class TokenbucketApplicationTests {
 
 	@Test
 	void contextLoads() {

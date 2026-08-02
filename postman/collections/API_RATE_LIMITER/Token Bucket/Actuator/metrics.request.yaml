@@ -1,0 +1,7 @@
+$kind: http-request
+name: metrics
+url: http://localhost:8080/actuator/metrics
+method: GET
+headers:
+  user_id: "1234"
+order: 3218744599738744

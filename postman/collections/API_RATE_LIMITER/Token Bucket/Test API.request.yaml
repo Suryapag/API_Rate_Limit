@@ -1,0 +1,7 @@
+$kind: http-request
+name: Test API
+url: http://localhost:8080/api/test
+method: GET
+headers:
+  user_id: "1122"
+order: 3536151813473590

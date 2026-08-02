@@ -1,0 +1,274 @@
+$kind: collection
+name: Token Bucket
+description: |-
+  ## 1\. Why Token Bucket over Fixed Window (quick contrast, since you just built Fixed Window)
+
+  |  | Fixed Window | Token Bucket |
+  | --- | --- | --- |
+  | Burst handling | Allows 2x burst at window edges (boundary problem) | Smooths bursts — controlled by bucket capacity |
+  | Refill model | Resets counter every window | Continuously refills tokens at a fixed rate |
+  | Real-world use | Simple APIs, low stakes | Stripe API, AWS API Gateway, Razorpay |
+  | Memory | 1 counter per key | 1 (tokens, lastRefillTimestamp) pair per key |
+
+  Token Bucket = a bucket holds tokens (max = capacity). Every request consumes 1 token. Tokens refill continuously at `refillRate` tokens/sec. If bucket is empty → reject (429).
+
+  ## 2\. Spring Initializr setup
+
+  Go to [https://start.spring.io](https://start.spring.io) and configure:
+
+  - **Project**: Maven
+      
+  - **Language**: Java
+      
+  - **Spring Boot**: latest stable 3.x (matches your existing multi-tenant SaaS project stack)
+      
+  - **Group**: `com.montbleu` (or whatever you used for fixed-window, keep it consistent across your rate-limiter repo)
+      
+  - **Artifact**: `token-bucket-rate-limiter`
+      
+  - **Java**: 21
+      
+
+  **Dependencies to add:**
+
+  - Spring Web (`spring-boot-starter-web`) — to expose a test endpoint
+      
+  - Spring Boot DevTools — optional, faster reload
+      
+  - Lombok — cuts boilerplate on your bucket state class
+      
+  - Spring Boot Actuator — optional but MNC-style teams add this for `/actuator/health`, `/actuator/metrics` from day one
+      
+
+  Generate → unzip → open in IntelliJ (or whatever you used before). Since you're already on a `Token_bucket` branch in your existing rate-limiter repo, you likely don't need a fresh Initializr project — just add these deps to your existing `pom.xml` if they're missing. Want me to check your Fixed Window repo's `pom.xml` structure first, or are you starting this as a standalone module?
+
+  ## 3\. Package structure (MNC convention)
+
+  ```
+  com.montbleu.ratelimiter
+   ├── config/
+   │    └── RateLimiterConfig.java       (bean wiring, @ConfigurationProperties)
+   ├── core/
+   │    ├── TokenBucket.java             (the actual bucket — thread-safe state)
+   │    └── RateLimiterService.java      (business logic: tryConsume, bucket lookup)
+   ├── filter/ or interceptor/
+   │    └── RateLimitInterceptor.java    (intercepts HTTP requests, applies limiter)
+   ├── web/
+   │    └── DemoController.java          (test endpoint to hit in Postman)
+   └── RateLimiterApplication.java
+
+   ```
+
+  This mirrors your multi-tenant auth service layering (config / core / web separation) — same discipline, different domain.
+
+  ## 4\. Core theory — the math
+
+  ```
+  tokens_now = min(capacity, tokens_at_last_refill + (elapsed_seconds * refillRate))
+
+   ```
+
+  Every time a request arrives:
+
+  1. Calculate elapsed time since `lastRefillTimestamp`
+      
+  2. Add `elapsed \\\* refillRate` tokens (cap at `capacity`)
+      
+  3. If `tokens >= 1` → consume 1, allow request
+      
+  4. Else → reject request
+      
+
+  No background thread needed — refill is _lazy_ (computed on each request), which is the elegant part interviewers want to hear you explain.
+
+  ## 5\. ASCII visualization
+
+  ```
+  Capacity = 10, refillRate = 2 tokens/sec
+  t=0s   [██████████] 10/10  → request arrives, consume 1 → 9/10
+  t=0.5s [█████████ ] 9/10   → request → 8/10
+  ...
+  t=3s   [░░░░░░░░░░] 0/10   → burst of 10 requests exhausted bucket
+  t=3.5s → 1 sec elapsed → +2 tokens → [██░░░░░░░░] 2/10 → allow 2 more requests
+
+   ```
+
+  Key insight vs Fixed Window: there's no hard reset at a window boundary — tokens trickle back continuously, so there's no "double burst at the edge" exploit.
+
+  ## 6\. Implementation — clean version first
+
+  **`TokenBucket.java`** (the state holder, thread-safe):Now the code — same layering discipline as your Fixed Window branch.
+
+  **`TokenBucket.java`**
+
+  ``` java
+  package com.montbleu.ratelimiter.core;
+  import java.util.concurrent.atomic.AtomicLong;
+  import java.util.concurrent.locks.ReentrantLock;
+  /**
+   * Thread-safe token bucket for a single rate-limit key (e.g. per API key, per IP, per tenant).
+   * Refill is lazy: tokens are computed on demand, not via a scheduled background thread.
+   */
+  public class TokenBucket {
+      private final long capacity;          // max tokens the bucket can hold
+      private final double refillTokensPerSecond;
+      private double availableTokens;       // current token count (double for fractional refill)
+      private long lastRefillTimestamp;     // nanoTime of last refill calc
+      private final ReentrantLock lock = new ReentrantLock();
+      public TokenBucket(long capacity, double refillTokensPerSecond) {
+          this.capacity = capacity;
+          this.refillTokensPerSecond = refillTokensPerSecond;
+          this.availableTokens = capacity;       // start full — standard convention
+          this.lastRefillTimestamp = System.nanoTime();
+      }
+      public boolean tryConsume() {
+          lock.lock();
+          try {
+              refill();
+              if (availableTokens >= 1) {
+                  availableTokens -= 1;
+                  return true;
+              }
+              return false;
+          } finally {
+              lock.unlock();
+          }
+      }
+      private void refill() {
+          long now = System.nanoTime();
+          double elapsedSeconds = (now - lastRefillTimestamp) / 1_000_000_000.0;
+          double tokensToAdd = elapsedSeconds * refillTokensPerSecond;
+          if (tokensToAdd > 0) {
+              availableTokens = Math.min(capacity, availableTokens + tokensToAdd);
+              lastRefillTimestamp = now;
+          }
+      }
+  }
+
+   ```
+
+  **Why** **`ReentrantLock`** **and not** **`synchronized`****?** — an interviewer will ask this. `synchronized` works fine here too (critical section is tiny), but `ReentrantLock` is the more "product-company" answer because it lets you later add `tryLock(timeout)` for non-blocking behavior under contention, and it composes better if you later swap to a `StampedLock` for read-heavy variants. For a per-key bucket like this, either is correct — but say this out loud in an interview, don't just pick one silently.
+
+  **`RateLimiterService.java`** — manages one bucket per key:
+
+  ``` java
+  package com.montbleu.ratelimiter.core;
+  import org.springframework.beans.factory.annotation.Value;
+  import org.springframework.stereotype.Service;
+  import java.util.concurrent.ConcurrentHashMap;
+  @Service
+  public class RateLimiterService {
+      private final ConcurrentHashMap<String, TokenBucket> buckets = new ConcurrentHashMap<>();
+      private final long capacity;
+      private final double refillRate;
+      public RateLimiterService(
+              @Value("${ratelimiter.capacity:10}") long capacity,
+              @Value("${ratelimiter.refill-rate:2}") double refillRate) {
+          this.capacity = capacity;
+          this.refillRate = refillRate;
+      }
+      public boolean isAllowed(String key) {
+          TokenBucket bucket = buckets.computeIfAbsent(key,
+                  k -> new TokenBucket(capacity, refillRate));
+          return bucket.tryConsume();
+      }
+  }
+
+   ```
+
+  `computeIfAbsent` on `ConcurrentHashMap` is the same pattern you already used in your Fixed Window branch — good, keep it consistent. It guarantees exactly one `TokenBucket` gets created per key even under concurrent first-requests (no double-init race).
+
+  **`application.yml`** (externalize config — MNC teams never hardcode limits):
+
+  ``` yaml
+  ratelimiter:
+    capacity: 10
+    refill-rate: 2.0
+
+   ```
+
+  **`RateLimitInterceptor.java`** — wires it into the HTTP layer:
+
+  ``` java
+  package com.montbleu.ratelimiter.filter;
+  import com.montbleu.ratelimiter.core.RateLimiterService;
+  import jakarta.servlet.http.HttpServletRequest;
+  import jakarta.servlet.http.HttpServletResponse;
+  import org.springframework.web.servlet.HandlerInterceptor;
+  public class RateLimitInterceptor implements HandlerInterceptor {
+      private final RateLimiterService rateLimiterService;
+      public RateLimitInterceptor(RateLimiterService rateLimiterService) {
+          this.rateLimiterService = rateLimiterService;
+      }
+      @Override
+      public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+          String key = request.getHeader("X-API-Key"); // or request.getRemoteAddr() for per-IP
+          if (key == null) key = "anonymous";
+          if (rateLimiterService.isAllowed(key)) {
+              return true;
+          }
+          response.setStatus(429);
+          response.setContentType("application/json");
+          response.getWriter().write("{\"error\":\"Rate limit exceeded. Try again shortly.\"}");
+          return false;
+      }
+  }
+
+   ```
+
+  **`RateLimiterConfig.java`** — registers the interceptor (this is the bean-wiring piece):
+
+  ``` java
+  package com.montbleu.ratelimiter.config;
+  import com.montbleu.ratelimiter.core.RateLimiterService;
+  import com.montbleu.ratelimiter.filter.RateLimitInterceptor;
+  import org.springframework.context.annotation.Configuration;
+  import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+  import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+  @Configuration
+  public class RateLimiterConfig implements WebMvcConfigurer {
+      private final RateLimiterService rateLimiterService;
+      public RateLimiterConfig(RateLimiterService rateLimiterService) {
+          this.rateLimiterService = rateLimiterService;
+      }
+      @Override
+      public void addInterceptors(InterceptorRegistry registry) {
+          registry.addInterceptor(new RateLimitInterceptor(rateLimiterService))
+                  .addPathPatterns("/api/**");
+      }
+  }
+
+   ```
+
+  ## 7\. Dry run
+
+  Capacity = 5, refillRate = 1 token/sec, bucket starts full (5 tokens).
+
+  - Requests 1–5 arrive instantly → each consumes 1 → bucket goes 5→4→3→2→1→0
+      
+  - Request 6 arrives at t=0.1s → `refill()` computes `elapsedSeconds ≈ 0.1`, `tokensToAdd ≈ 0.1` → `availableTokens = 0.1` → `0.1 >= 1` is false → **rejected (429)**
+      
+  - Request 7 arrives at t=1.2s (1.1s later) → `tokensToAdd ≈ 1.1` → `availableTokens = min(5, 0.1+1.1) = 1.2` → `>= 1` → **allowed**, tokens now 0.2
+      
+
+  Edge case to test: two threads calling `tryConsume()` at the exact same nanosecond on the same key — the `ReentrantLock` inside `TokenBucket` serializes them, so no double-consumption of the same token. This is the concurrency edge case an interviewer will push on.
+
+  ## 8\. Comparison vs Fixed Window (recap)
+
+  Fixed Window: `Map counter` reset every window — simpler code, but the boundary burst flaw. Token Bucket: slightly more state per key (`tokens`, `lastRefillTimestamp`) but no boundary flaw and naturally allows short bursts up to `capacity`, which is what real traffic actually looks like.
+
+  ## 9\. What to test (JUnit, matching your Fixed Window branch's test style)
+
+  - Bucket starts full, allows exactly `capacity` requests, then rejects
+      
+  - After waiting `1/refillRate` seconds, exactly 1 more request is allowed
+      
+  - Bucket never exceeds `capacity` even after long idle time
+      
+  - Concurrent access with `ExecutorService` + `CountDownLatch` — fire 100 threads at a bucket of capacity 10, assert exactly 10 succeed
+      
+
+  Want me to write out the JUnit test class next, or do a code review first if you've already started on the branch?
+
+  EndFragment
+order: 3805585408524287

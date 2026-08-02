@@ -1,1 +1,56 @@
 $kind: collection
+name: API_RATE_LIMITER
+description: |-
+  StartFragment
+
+  ## 📚 Reference Notes (collected after starting the build)
+
+  Full algorithm catalog for API Gateway rate limiting, organized by what to actually implement vs. what to just know conceptually.
+
+  ### Algorithms to implement (core learning value)
+
+  | # | Algorithm | Mechanism | Verdict |
+  | --- | --- | --- | --- |
+  | 1 | **Fixed Window Counter** | `INCR` • `EXPIRE` per window | Build Day 1 — baseline, shows the boundary-burst flaw firsthand |
+  | 2 | **Sliding Window Log** | Store every request timestamp, drop entries older than window, count what's left | Skip full build — memory-heavy, but know how it differs from the counter variant |
+  | 3 | **Sliding Window Counter** | Current window count + weighted portion of previous window | Build Day 2 — the practical fix to Fixed Window |
+  | 4 | **Token Bucket** ⭐ | Bucket refills continuously; each request consumes a token | Build Day 3 — most asked in interviews, used by Spring Cloud Gateway/AWS/NGINX/Envoy |
+  | 5 | **Leaky Bucket** | Requests queue up, processed at a constant output rate | Build as a stretch variant — good talking point vs. Token Bucket (smooths bursts instead of allowing them) |
+  | 6 | **Concurrency Limiter** | Caps _in-flight_ requests, not requests/sec | Good for long-running endpoints (e.g. file upload/export APIs) — mention as a variant, optional to build |
+  | 13 | **Distributed Rate Limiter** | Multiple gateway instances share state via Redis | This is what makes Day 3-4 realistic — you're already building this by using Redis instead of in-memory counters |
+  | 14 | **Adaptive Rate Limiter** | Limit shifts based on server health (CPU/latency) | Advanced/stretch — could hook into Spring Actuator metrics to adjust bucket size dynamically |
+
+  ### Scoping dimensions to layer on top (not separate algorithms — these are "who/where does the limit apply to")
+
+  - **Per User** — key = `userId`
+      
+  - **Per API Key** — key = `apiKey` (classic SaaS public-API pattern)
+      
+  - **Per IP** — key = client IP, for anonymous/public endpoints
+      
+  - **Per Route** — different limits per endpoint (`/login`: 5/min, `/search`: 100/min, `/payment`: 10/min)
+      
+  - **Per Tenant** — ties directly into your multi-tenant SaaS auth project's tenant context
+      
+  - **Global** — one ceiling for the whole system, protects infra regardless of user/tenant
+      
+  - **Priority-Based** — premium vs. free vs. guest get different limits (combine with Per User)
+      
+
+  **Design takeaway:** the _key_ you build the Redis key from (`rateLimit:{scope}:{identifier}:{window}`) is what turns one algorithm into Per User / Per IP / Per Route / Per Tenant — you don't need separate code paths, just a configurable key strategy.
+
+  ### Recommended build order for Spring Boot + Spring Cloud Gateway (confirmed against reference)
+
+  1. Fixed Window (baseline, see the flaw)
+      
+  2. Token Bucket ⭐ (most important — ship this well)
+      
+  3. Sliding Window Counter (the accuracy fix)
+      
+  4. Make it distributed via Redis (you're doing this from Day 1 anyway)
+      
+  5. Add Per User / Per IP / Per Route key strategies (config-driven, not new algorithms)
+      
+  6. Concurrency Limiting (optional)
+      
+  7. Adaptive Rate Limiting (optional, advanced — good portfolio differentiator if you have time)
